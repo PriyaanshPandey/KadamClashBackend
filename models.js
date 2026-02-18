@@ -9,7 +9,7 @@ const userSchema = new mongoose.Schema({
     trim: true
   }
 }, {
-  timestamps: true // automatically adds createdAt and updatedAt
+  timestamps: true
 });
 
 // Territory Schema
@@ -23,10 +23,11 @@ const territorySchema = new mongoose.Schema({
     type: {
       type: String,
       enum: ['Polygon'],
-      required: true
+      required: true,
+      default: 'Polygon'
     },
     coordinates: {
-      type: [[[Number]]], // Array of arrays of arrays of numbers
+      type: [[[Number]]],
       required: true
     }
   },
@@ -36,19 +37,17 @@ const territorySchema = new mongoose.Schema({
   },
   bestTime: {
     type: Number,
-    required: true,
-    min: 0
+    required: true
   },
   maxLaps: {
     type: Number,
-    required: true,
-    min: 1
+    required: true
   }
 }, {
   timestamps: true
 });
 
-// Create 2dsphere index for geospatial queries
+// Create 2dsphere index
 territorySchema.index({ geometry: '2dsphere' });
 
 // Attempt Schema
@@ -65,30 +64,22 @@ const attemptSchema = new mongoose.Schema({
   },
   duration: {
     type: Number,
-    required: true,
-    min: 0
+    required: true
   },
   laps: {
     type: Number,
-    required: true,
-    min: 1
+    required: true
   },
   avgSpeed: {
     type: Number,
-    required: true,
-    min: 0
+    required: true
   }
 }, {
   timestamps: true
 });
 
-// Create models
 const User = mongoose.model('User', userSchema);
 const Territory = mongoose.model('Territory', territorySchema);
 const Attempt = mongoose.model('Attempt', attemptSchema);
 
-module.exports = {
-  User,
-  Territory,
-  Attempt
-};
+module.exports = { User, Territory, Attempt };
