@@ -42,10 +42,15 @@ const territorySchema = new mongoose.Schema({
   maxLaps: {
     type: Number,
     required: true
+  },
+  avgSpeed: {               // <-- new field
+    type: Number,
+    required: true
   }
 }, {
   timestamps: true
 });
+    
 
 // Create 2dsphere index
 territorySchema.index({ geometry: '2dsphere' });
