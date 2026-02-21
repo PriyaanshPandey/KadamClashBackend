@@ -58,7 +58,10 @@ mongoose.connection.on('reconnected', () => {
 });
 
 // API Routes
-app.post('/api/run', async (req, res) => {
+
+      
+ 
+    app.post('/api/run', async (req, res) => {
   try {
     const { userId, polygon, duration, laps, avgSpeed } = req.body;
     
@@ -75,17 +78,16 @@ app.post('/api/run', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    // Find or create user (for testing)
+    // Find user
     let user = await User.findById(userId);
     if (!user) {
-      // Try to find by username if userId is actually a username
       user = await User.findOne({ username: userId });
       if (!user) {
         return res.status(404).json({ error: 'User not found' });
       }
     }
     
-    // Calculate area
+    // Calculate run area
     const runArea = calculateArea(polygon);
     
     // Find intersecting territories
@@ -95,12 +97,15 @@ app.post('/api/run', async (req, res) => {
           $geometry: polygon
         }
       }
-    });
+    }).populate('ownerId', 'username');
     
     let created = false;
     let captured = false;
+    let defended = false;
     let territoryId = null;
     let newOwner = null;
+    let previousOwner = null;
+    let defender = null;
     
     if (intersectingTerritories.length === 0) {
       // Create new territory
@@ -109,7 +114,8 @@ app.post('/api/run', async (req, res) => {
         geometry: polygon,
         area: runArea,
         bestTime: duration / laps,
-        maxLaps: laps
+        maxLaps: laps,
+        avgSpeed: avgSpeed
       });
       
       await newTerritory.save();
@@ -118,7 +124,6 @@ app.post('/api/run', async (req, res) => {
       territoryId = newTerritory._id;
       newOwner = user._id;
       
-      // Save attempt
       await new Attempt({
         userId: user._id,
         territoryId: newTerritory._id,
@@ -132,22 +137,30 @@ app.post('/api/run', async (req, res) => {
       
       for (const territory of intersectingTerritories) {
         const coverage = calculateCoverage(polygon, territory.geometry);
+        console.log(`Coverage with territory ${territory._id}: ${coverage}%`);
         
         if (coverage >= 70 && !battled) {
           const challengerWins = battleOutcome(territory, { duration, laps });
+          console.log('Challenger wins?', challengerWins);
+          
+          previousOwner = territory.ownerId?.username || 'unknown';
           
           if (challengerWins) {
+            // Capture: update territory with new owner and new stats
             territory.ownerId = user._id;
             territory.bestTime = duration / laps;
             territory.maxLaps = laps;
+            territory.avgSpeed = avgSpeed;
             await territory.save();
             
             captured = true;
             territoryId = territory._id;
             newOwner = user._id;
           } else {
+            // Defender wins
+            defended = true;
             territoryId = territory._id;
-            newOwner = territory.ownerId;
+            defender = territory.ownerId?.username || 'unknown';
           }
           
           battled = true;
@@ -163,13 +176,14 @@ app.post('/api/run', async (req, res) => {
       }
       
       if (!battled) {
-        // Create new territory
+        // No territory with enough coverage – create new
         const newTerritory = new Territory({
           ownerId: user._id,
           geometry: polygon,
           area: runArea,
           bestTime: duration / laps,
-          maxLaps: laps
+          maxLaps: laps,
+          avgSpeed: avgSpeed
         });
         
         await newTerritory.save();
@@ -191,8 +205,11 @@ app.post('/api/run', async (req, res) => {
     res.json({
       created,
       captured,
+      defended,
       territoryId: territoryId ? territoryId.toString() : null,
-      newOwner: newOwner ? newOwner.toString() : null
+      newOwner: newOwner ? newOwner.toString() : null,
+      previousOwner: previousOwner,   // for victory message
+      defender: defender               // for defeat message
     });
     
   } catch (error) {
@@ -207,11 +224,9 @@ app.get('/api/territories', async (req, res) => {
       return res.status(503).json({ error: 'Database not connected' });
     }
     
-    const territories = await Territory.find({}, {
-      geometry: 1,
-      ownerId: 1,
-      _id: 1
-    }).populate('ownerId', 'username');
+    const territories = await Territory.find()
+      .populate('ownerId', 'username')
+      .select('geometry ownerId area bestTime maxLaps avgSpeed'); // or just omit .select()
     
     res.json(territories);
   } catch (error) {
