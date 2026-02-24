@@ -4,7 +4,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const { User, Territory, Attempt } = require('./models');
-const { calculateCoverage, battleOutcome, calculateArea } = require('./utils');
+
 
 const app = express();
 
