@@ -90,8 +90,17 @@ function evaluateChallenge(runPolygon, runAvgSpeed, runLaps, territory) {
  * Calculate area of a GeoJSON geometry.
  */
 function calculateArea(geometry) {
-  const polygon = turf.polygon(geometry.coordinates);
-  return turf.area(polygon);
+  try {
+    if (!geometry || !geometry.coordinates) {
+      console.error('calculateArea received invalid geometry:', geometry);
+      return 0;
+    }
+    const polygon = turf.polygon(geometry.coordinates);
+    return turf.area(polygon);
+  } catch (error) {
+    console.error('Error in calculateArea:', error, 'geometry:', geometry);
+    return 0;
+  }
 }
 
 module.exports = {
