@@ -1,3 +1,5 @@
+const { evaluateChallenge, calculateArea } = require('./utils');
+const turf = require('@turf/turf');
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -58,72 +60,46 @@ mongoose.connection.on('reconnected', () => {
 });
 
 // API Routes
-
-      
- 
-    app.post('/api/run', async (req, res) => {
+app.post('/api/run', async (req, res) => {
   try {
     const { userId, polygon, duration, laps, avgSpeed } = req.body;
-    
-    // Check MongoDB connection
+
+    // Check DB connection
     if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ 
-        error: 'Database not connected',
-        message: 'Please try again in a few moments'
-      });
+      return res.status(503).json({ error: 'Database not connected' });
     }
-    
+
     // Validate input
     if (!userId || !polygon || !duration || !laps || !avgSpeed) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    
+
     // Find user
     let user = await User.findById(userId);
-    if (!user) {
-      user = await User.findOne({ username: userId });
-      if (!user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-    }
-    
-    // Calculate run area
+    if (!user) user = await User.findOne({ username: userId });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const runPolygon = polygon; // already GeoJSON
     const runArea = calculateArea(polygon);
-    
-    // Find intersecting territories
-    const intersectingTerritories = await Territory.find({
-      geometry: {
-        $geoIntersects: {
-          $geometry: polygon
-        }
-      }
+
+    // Find all intersecting territories that are NOT owned by the user
+    const intersecting = await Territory.find({
+      geometry: { $geoIntersects: { $geometry: runPolygon } },
+      ownerId: { $ne: user._id }
     }).populate('ownerId', 'username');
-    
-    let created = false;
-    let captured = false;
-    let defended = false;
-    let territoryId = null;
-    let newOwner = null;
-    let previousOwner = null;
-    let defender = null;
-    
-    if (intersectingTerritories.length === 0) {
-      // Create new territory
+
+    // If no intersecting territories → create new
+    if (intersecting.length === 0) {
       const newTerritory = new Territory({
         ownerId: user._id,
-        geometry: polygon,
+        geometry: runPolygon,
         area: runArea,
         bestTime: duration / laps,
         maxLaps: laps,
         avgSpeed: avgSpeed
       });
-      
       await newTerritory.save();
-      
-      created = true;
-      territoryId = newTerritory._id;
-      newOwner = user._id;
-      
+
       await new Attempt({
         userId: user._id,
         territoryId: newTerritory._id,
@@ -131,92 +107,104 @@ mongoose.connection.on('reconnected', () => {
         laps,
         avgSpeed
       }).save();
-      
-    } else {
-      let battled = false;
-      
-      for (const territory of intersectingTerritories) {
-        const coverage = calculateCoverage(polygon, territory.geometry);
-        console.log(`Coverage with territory ${territory._id}: ${coverage}%`);
-        
-        if (coverage >= 70 && !battled) {
-          const challengerWins = battleOutcome(territory, { duration, laps });
-          console.log('Challenger wins?', challengerWins);
-          
-          previousOwner = territory.ownerId?.username || 'unknown';
-          
-          if (challengerWins) {
-            // Capture: update territory with new owner and new stats
-            territory.ownerId = user._id;
-            territory.bestTime = duration / laps;
-            territory.maxLaps = laps;
-            territory.avgSpeed = avgSpeed;
-            await territory.save();
-            
-            captured = true;
-            territoryId = territory._id;
-            newOwner = user._id;
-          } else {
-            // Defender wins
-            defended = true;
-            territoryId = territory._id;
-            defender = territory.ownerId?.username || 'unknown';
-          }
-          
-          battled = true;
-          
-          await new Attempt({
-            userId: user._id,
-            territoryId: territory._id,
-            duration,
-            laps,
-            avgSpeed
-          }).save();
-        }
-      }
-      
-      if (!battled) {
-        // No territory with enough coverage – create new
-        const newTerritory = new Territory({
-          ownerId: user._id,
-          geometry: polygon,
-          area: runArea,
-          bestTime: duration / laps,
-          maxLaps: laps,
-          avgSpeed: avgSpeed
-        });
-        
-        await newTerritory.save();
-        
-        created = true;
-        territoryId = newTerritory._id;
-        newOwner = user._id;
-        
-        await new Attempt({
-          userId: user._id,
-          territoryId: newTerritory._id,
-          duration,
-          laps,
-          avgSpeed
-        }).save();
+
+      return res.json({
+        created: true,
+        captured: false,
+        defended: false,
+        territoryId: newTerritory._id.toString(),
+        newOwner: user._id.toString(),
+        previousOwner: null,
+        defender: null
+      });
+    }
+
+    // Evaluate each enemy using the new logic
+    let allWon = true;
+    let conquered = [];
+    let defeatMessage = '';
+
+    for (const territory of intersecting) {
+      const result = evaluateChallenge(runPolygon, avgSpeed, laps, territory);
+      if (result.outcome === 'lost') {
+        allWon = false;
+        defeatMessage = result.message || 'You lost.';
+        break;
+      } else if (result.outcome === 'won' || result.outcome === 'autoWon') {
+        conquered.push(territory);
       }
     }
-    
-    res.json({
-      created,
-      captured,
-      defended,
-      territoryId: territoryId ? territoryId.toString() : null,
-      newOwner: newOwner ? newOwner.toString() : null,
-      previousOwner: previousOwner,   // for victory message
-      defender: defender               // for defeat message
+
+    if (!allWon) {
+      // Defeated – no territory change
+      return res.json({
+        created: false,
+        captured: false,
+        defended: true,
+        territoryId: null,
+        newOwner: null,
+        previousOwner: null,
+        defender: defeatMessage.includes('defeated') ? defeatMessage.split('by ')[1]?.replace('.', '') : null
+      });
+    }
+
+    // All enemies conquered → merge everything
+    let mergedPolygon = runPolygon;
+    for (const t of conquered) {
+      try {
+        mergedPolygon = turf.union(mergedPolygon, t.geometry);
+      } catch (err) {
+        console.warn(`Union failed for territory ${t._id}`, err);
+        // Continue without it? Better to fail? We'll proceed but may lose that territory.
+      }
+    }
+
+    // Delete conquered territories
+    const conqueredIds = conquered.map(t => t._id);
+    await Territory.deleteMany({ _id: { $in: conqueredIds } });
+
+    // Create new merged territory
+    const mergedArea = calculateArea(mergedPolygon);
+    const newTerritory = new Territory({
+      ownerId: user._id,
+      geometry: mergedPolygon,
+      area: mergedArea,
+      bestTime: duration / laps,  // using current run's stats
+      maxLaps: laps,
+      avgSpeed: avgSpeed
     });
-    
+    await newTerritory.save();
+
+    // Record attempt
+    await new Attempt({
+      userId: user._id,
+      territoryId: newTerritory._id,
+      duration,
+      laps,
+      avgSpeed
+    }).save();
+
+    // Determine previous owner for victory message (use first conquered)
+    const previousOwner = conquered[0]?.ownerId?.username || null;
+
+    res.json({
+      created: false,
+      captured: true,
+      defended: false,
+      territoryId: newTerritory._id.toString(),
+      newOwner: user._id.toString(),
+      previousOwner,
+      defender: null
+    });
+
   } catch (error) {
     console.error('Run error:', error);
     res.status(500).json({ error: error.message });
   }
 });
+      
+ 
+  
 
 app.get('/api/territories', async (req, res) => {
   try {
