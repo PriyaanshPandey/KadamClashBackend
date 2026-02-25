@@ -5,7 +5,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const { User, Territory, Attempt } = require('./models');
 
-
 const app = express();
 
 // Middleware
@@ -28,7 +27,7 @@ if (!MONGODB_URI) {
 mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/territory-game', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 30000, // Increased timeout for Render
+  serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
 })
 .then(() => {
@@ -41,20 +40,15 @@ mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/territory-game', {
   console.error('Error name:', err.name);
   console.error('Error message:', err.message);
   console.error('Full error:', err);
-  
-  // Don't exit - let the server try to reconnect
   console.log('Will retry connection...');
 });
 
-// Handle connection events
 mongoose.connection.on('error', (err) => {
   console.error('MongoDB connection error event:', err);
 });
-
 mongoose.connection.on('disconnected', () => {
   console.log('MongoDB disconnected');
 });
-
 mongoose.connection.on('reconnected', () => {
   console.log('MongoDB reconnected');
 });
@@ -64,31 +58,28 @@ app.post('/api/run', async (req, res) => {
   try {
     const { userId, polygon, duration, laps, avgSpeed } = req.body;
 
-    // Check DB connection
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({ error: 'Database not connected' });
     }
 
-    // Validate input
     if (!userId || !polygon || !duration || !laps || !avgSpeed) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Find user
     let user = await User.findById(userId);
     if (!user) user = await User.findOne({ username: userId });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const runPolygon = polygon; // already GeoJSON
+    const runPolygon = polygon;
     const runArea = calculateArea(polygon);
 
-    // Find all intersecting territories that are NOT owned by the user
+    // Find intersecting territories not owned by user
     const intersecting = await Territory.find({
       geometry: { $geoIntersects: { $geometry: runPolygon } },
       ownerId: { $ne: user._id }
     }).populate('ownerId', 'username');
 
-    // If no intersecting territories → create new
+    // No intersecting territories → create new
     if (intersecting.length === 0) {
       const newTerritory = new Territory({
         ownerId: user._id,
@@ -119,7 +110,7 @@ app.post('/api/run', async (req, res) => {
       });
     }
 
-    // Evaluate each enemy using the new logic
+    // Evaluate each enemy
     let allWon = true;
     let conquered = [];
     let defeatMessage = '';
@@ -130,13 +121,12 @@ app.post('/api/run', async (req, res) => {
         allWon = false;
         defeatMessage = result.message || 'You lost.';
         break;
-      } else if (result.outcome === 'won' || result.outcome === 'autoWon') {
+      } else if (result.outcome === 'won') {
         conquered.push(territory);
       }
     }
 
     if (!allWon) {
-      // Defeated – no territory change
       return res.json({
         created: false,
         captured: false,
@@ -148,34 +138,23 @@ app.post('/api/run', async (req, res) => {
       });
     }
 
-    // All enemies conquered → merge everything
-    let mergedPolygon = runPolygon;
-    for (const t of conquered) {
-      try {
-        mergedPolygon = turf.union(mergedPolygon, t.geometry);
-      } catch (err) {
-        console.warn(`Union failed for territory ${t._id}`, err);
-        // Continue without it? Better to fail? We'll proceed but may lose that territory.
-      }
+    // All enemies conquered → delete them and create new territory with run polygon
+    const conqueredIds = conquered.map(t => t._id);
+    if (conqueredIds.length > 0) {
+      await Territory.deleteMany({ _id: { $in: conqueredIds } });
     }
 
-    // Delete conquered territories
-    const conqueredIds = conquered.map(t => t._id);
-    await Territory.deleteMany({ _id: { $in: conqueredIds } });
-
-    // Create new merged territory
-    const mergedArea = calculateArea(mergedPolygon);
+    // Create new territory (the run polygon itself, no union needed)
     const newTerritory = new Territory({
       ownerId: user._id,
-      geometry: mergedPolygon,
-      area: mergedArea,
-      bestTime: duration / laps,  // using current run's stats
+      geometry: runPolygon,
+      area: runArea,
+      bestTime: duration / laps,
       maxLaps: laps,
       avgSpeed: avgSpeed
     });
     await newTerritory.save();
 
-    // Record attempt
     await new Attempt({
       userId: user._id,
       territoryId: newTerritory._id,
@@ -184,7 +163,6 @@ app.post('/api/run', async (req, res) => {
       avgSpeed
     }).save();
 
-    // Determine previous owner for victory message (use first conquered)
     const previousOwner = conquered[0]?.ownerId?.username || null;
 
     res.json({
@@ -202,20 +180,15 @@ app.post('/api/run', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-      
- 
-  
 
 app.get('/api/territories', async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({ error: 'Database not connected' });
     }
-    
     const territories = await Territory.find()
       .populate('ownerId', 'username')
-      .select('geometry ownerId area bestTime maxLaps avgSpeed'); // or just omit .select()
-    
+      .select('geometry ownerId area bestTime maxLaps avgSpeed');
     res.json(territories);
   } catch (error) {
     console.error('Territories error:', error);
@@ -223,25 +196,18 @@ app.get('/api/territories', async (req, res) => {
   }
 });
 
-// Create a test user
 app.post('/api/users', async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({ error: 'Database not connected' });
     }
-    
     const { username } = req.body;
-    
-    if (!username) {
-      return res.status(400).json({ error: 'Username required' });
-    }
-    
+    if (!username) return res.status(400).json({ error: 'Username required' });
     let user = await User.findOne({ username });
     if (!user) {
       user = new User({ username });
       await user.save();
     }
-    
     res.json({
       id: user._id,
       username: user.username,
@@ -253,13 +219,11 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-// Get all users
 app.get('/api/users', async (req, res) => {
   try {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({ error: 'Database not connected' });
     }
-    
     const users = await User.find({}, 'username createdAt');
     res.json(users);
   } catch (error) {
@@ -268,7 +232,6 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Health check - VERY IMPORTANT for Render
 app.get('/health', (req, res) => {
   const dbState = mongoose.connection.readyState;
   const states = {
@@ -277,7 +240,6 @@ app.get('/health', (req, res) => {
     2: 'connecting',
     3: 'disconnecting'
   };
-  
   res.json({
     status: 'OK',
     message: 'Server is running on Render',
@@ -288,7 +250,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Root route
 app.get('/', (req, res) => {
   res.json({
     name: 'Territory Run Game API',
@@ -303,9 +264,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// IMPORTANT: This is the port Render will use
 const PORT = process.env.PORT || 5000;
-
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`=================================`);
   console.log(`🚀 Server started successfully!`);
