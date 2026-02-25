@@ -1,89 +1,37 @@
 const turf = require('@turf/turf');
 
 /**
- * Calculate the geometric relation between two polygons.
- * Returns 'contains', 'inside', or 'overlap'.
- */
-function getRelation(polygonA, polygonB) {
-  const contains = turf.booleanContains(polygonA, polygonB);
-  if (contains) return 'contains';
-  const inside = turf.booleanContains(polygonB, polygonA);
-  if (inside) return 'inside';
-  return 'overlap';
-}
-
-/**
- * Calculate the battle score based on avg speed and laps.
- * Higher score wins.
- */
-function battleScore(avgSpeed, laps) {
-  return avgSpeed * 1000 + laps * 10;
-}
-
-/**
- * Determine if the challenger wins against a territory.
- * Uses geometric relation, size ratio (80-120%), and battle score.
- * Returns an object { outcome: 'won'|'lost'|'autoWon', message? }.
+ * Determine the outcome of a run against a territory based on containment.
+ * Returns { outcome: 'won'|'lost', message?: string }.
+ * - 'won' if run polygon contains enemy territory.
+ * - 'lost' if enemy contains run, or if they intersect without containment.
+ * - If no intersection, the calling function will handle separately.
  */
 function evaluateChallenge(runPolygon, runAvgSpeed, runLaps, territory) {
   const enemyGeo = territory.geometry;
-  const runArea = turf.area(runPolygon);
-  const enemyArea = territory.area || turf.area(enemyGeo);
-  const areaRatio = runArea / enemyArea;
-  const relation = getRelation(runPolygon, enemyGeo);
+  const userContainsEnemy = turf.booleanContains(runPolygon, enemyGeo);
+  const enemyContainsUser = turf.booleanContains(enemyGeo, runPolygon);
 
-  // Case 2: User inside enemy territory → automatic loss
-  if (relation === 'inside') {
+  if (userContainsEnemy) {
+    return { outcome: 'won' };
+  } else if (enemyContainsUser) {
     return {
       outcome: 'lost',
-      message: `Your run is inside ${territory.ownerId?.username || 'unknown'}'s territory.`
+      message: `Your run is inside ${territory.ownerId?.username || 'unknown'}'s territory – no new territory.`
     };
-  }
-
-  // For contains or overlap, check size range
-  const sizeOk = areaRatio >= 0.8 && areaRatio <= 1.2;
-
-  if (relation === 'contains') {
-    if (!sizeOk) {
-      // Auto-win because you completely surround them (size mismatch)
-      return { outcome: 'autoWon' };
-    } else {
-      // Battle based on score
-      const userScore = battleScore(runAvgSpeed, runLaps);
-      const enemyScore = battleScore(territory.avgSpeed || 0, territory.maxLaps || 1);
-      if (userScore > enemyScore) {
-        return { outcome: 'won' };
-      } else {
-        return {
-          outcome: 'lost',
-          message: `😵 You were defeated by ${territory.ownerId?.username || 'unknown'}.`
-        };
-      }
-    }
-  }
-
-  if (relation === 'overlap') {
-    if (!sizeOk) {
+  } else {
+    // They intersect but neither contains the other → loss
+    const intersect = turf.intersect(runPolygon, enemyGeo);
+    if (intersect) {
       return {
         outcome: 'lost',
-        message: `Your run overlaps ${territory.ownerId?.username || 'unknown'}'s territory but you are too ${areaRatio < 0.8 ? 'small' : 'large'} to challenge.`
+        message: `Your run overlaps ${territory.ownerId?.username || 'unknown'}'s territory but does not encircle it.`
       };
     } else {
-      const userScore = battleScore(runAvgSpeed, runLaps);
-      const enemyScore = battleScore(territory.avgSpeed || 0, territory.maxLaps || 1);
-      if (userScore > enemyScore) {
-        return { outcome: 'won' };
-      } else {
-        return {
-          outcome: 'lost',
-          message: `😵 You were defeated by ${territory.ownerId?.username || 'unknown'}.`
-        };
-      }
+      // No intersection – should not happen because we only call this for intersecting territories
+      return { outcome: 'lost', message: 'Unknown error.' };
     }
   }
-
-  // Fallback (should not happen)
-  return { outcome: 'lost', message: 'Unknown error.' };
 }
 
 /**
@@ -104,8 +52,6 @@ function calculateArea(geometry) {
 }
 
 module.exports = {
-  getRelation,
-  battleScore,
   evaluateChallenge,
   calculateArea
 };
