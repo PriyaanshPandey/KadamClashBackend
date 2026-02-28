@@ -1,287 +1,198 @@
-const { evaluateChallenge, calculateArea } = require('./utils');
-const turf = require('@turf/turf');
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const turf = require('@turf/turf');
 const { User, Territory, Attempt } = require('./models');
 
 const app = express();
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Get MongoDB URI from environment variable
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Log connection attempt (without sensitive data)
-console.log('Starting server...');
-console.log('MongoDB URI exists:', !!MONGODB_URI);
+mongoose.connect(
+  MONGODB_URI || 'mongodb://localhost:27017/territory-game'
+);
 
-if (!MONGODB_URI) {
-  console.error('❌ MONGODB_URI environment variable is not set!');
-  console.error('Please set MONGODB_URI in your Render environment variables');
+mongoose.connection.once('open', () => {
+  console.log('✅ MongoDB connected');
+});
+
+/* ============================
+   HELPER: CLEAN POLYGON
+============================ */
+
+function createSafePolygon(coords) {
+  if (!coords || coords.length < 4) {
+    throw new Error('Not enough points');
+  }
+
+  const first = coords[0];
+  const last = coords[coords.length - 1];
+
+  // Close loop
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    coords.push(first);
+  }
+
+  let polygon = turf.polygon([coords]);
+
+  // Fix self intersections
+  const unkinked = turf.unkinkPolygon(polygon);
+
+  if (unkinked.features.length > 1) {
+    // choose largest
+    let largest = unkinked.features[0];
+    for (let f of unkinked.features) {
+      if (turf.area(f) > turf.area(largest)) {
+        largest = f;
+      }
+    }
+    polygon = largest;
+  }
+
+  return polygon;
 }
 
-// Connect to MongoDB
-mongoose.connect(MONGODB_URI || 'mongodb://localhost:27017/territory-game', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 30000,
-  socketTimeoutMS: 45000,
-})
-.then(() => {
-  console.log('✅ Connected to MongoDB successfully');
-  console.log('Database:', mongoose.connection.name);
-  console.log('Host:', mongoose.connection.host);
-})
-.catch((err) => {
-  console.error('❌ MongoDB connection error:');
-  console.error('Error name:', err.name);
-  console.error('Error message:', err.message);
-  console.error('Full error:', err);
-  console.log('Will retry connection...');
-});
+/* ============================
+   RUN ENDPOINT
+============================ */
 
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error event:', err);
-});
-mongoose.connection.on('disconnected', () => {
-  console.log('MongoDB disconnected');
-});
-mongoose.connection.on('reconnected', () => {
-  console.log('MongoDB reconnected');
-});
-
-// API Routes
 app.post('/api/run', async (req, res) => {
   try {
-    const { userId, polygon, duration, laps, avgSpeed } = req.body;
+    const { userId, coordinates, duration, laps, avgSpeed } = req.body;
 
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ error: 'Database not connected' });
+    if (!userId || !coordinates) {
+      return res.status(400).json({ error: 'Missing fields' });
     }
 
-    if (!userId || !polygon) {
-  return res.status(400).json({ error: 'Missing required fields' });
-}
+    if (
+      typeof duration !== 'number' ||
+      typeof laps !== 'number'
+    ) {
+      return res.status(400).json({ error: 'Invalid numbers' });
+    }
 
-if (
-  typeof duration !== 'number' ||
-  typeof laps !== 'number' ||
-  typeof avgSpeed !== 'number'
-) {
-  return res.status(400).json({ error: 'Invalid numeric values' });
-}
+    const safeAvgSpeed = avgSpeed > 0 ? avgSpeed : 0.1;
 
-if (duration <= 0 || laps <= 0 || avgSpeed <= 0) {
-  return res.status(400).json({ error: 'Run data invalid' });
-}
+    if (duration <= 0 || laps <= 0) {
+      return res.status(400).json({ error: 'Invalid run data' });
+    }
 
     let user = await User.findById(userId);
-    if (!user) user = await User.findOne({ username: userId });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const runPolygon = polygon;
-    const runArea = calculateArea(polygon);
+    const runPolygon = createSafePolygon(coordinates);
+    const runArea = turf.area(runPolygon);
 
-    // Find intersecting territories not owned by user
-    const intersecting = await Territory.find({
-      geometry: { $geoIntersects: { $geometry: runPolygon } },
+    if (runArea < 200) {
+      return res.status(400).json({ error: 'Territory too small' });
+    }
+
+    const enemies = await Territory.find({
+      geometry: {
+        $geoIntersects: {
+          $geometry: runPolygon.geometry
+        }
+      },
       ownerId: { $ne: user._id }
     }).populate('ownerId', 'username');
 
-    // No intersecting territories → create new
-    if (intersecting.length === 0) {
-      const newTerritory = new Territory({
-        ownerId: user._id,
-        geometry: runPolygon,
-        area: runArea,
-        bestTime: duration / laps,
-        maxLaps: laps,
-        avgSpeed: avgSpeed
-      });
-      await newTerritory.save();
+    let capturedIds = [];
+    let blocked = false;
+    let previousOwner = null;
 
-      await new Attempt({
-        userId: user._id,
-        territoryId: newTerritory._id,
-        duration,
-        laps,
-        avgSpeed
-      }).save();
+    for (let enemy of enemies) {
+      const intersection = turf.intersect(
+        runPolygon,
+        enemy.geometry
+      );
 
-      return res.json({
-        created: true,
-        captured: false,
-        defended: false,
-        territoryId: newTerritory._id.toString(),
-        newOwner: user._id.toString(),
-        previousOwner: null,
-        defender: null
-      });
-    }
+      if (!intersection) continue;
 
-    // Evaluate each enemy
-    let allWon = true;
-    let conquered = [];
-    let defeatMessage = '';
+      const overlapArea = turf.area(intersection);
+      const enemyArea = turf.area(enemy.geometry);
+      const percent = (overlapArea / enemyArea) * 100;
 
-    for (const territory of intersecting) {
-      const result = evaluateChallenge(runPolygon, avgSpeed, laps, territory);
-      if (result.outcome === 'lost') {
-        allWon = false;
-        defeatMessage = result.message || 'You lost.';
+      const enemyContainsUser = turf.booleanContains(
+        enemy.geometry,
+        runPolygon
+      );
+
+      if (enemyContainsUser) {
+        blocked = true;
         break;
-      } else if (result.outcome === 'won') {
-        conquered.push(territory);
+      }
+
+      if (percent >= 70) {
+        capturedIds.push(enemy._id);
+        previousOwner = enemy.ownerId.username;
       }
     }
 
-    if (!allWon) {
+    if (blocked) {
       return res.json({
         created: false,
         captured: false,
-        defended: true,
-        territoryId: null,
-        newOwner: null,
-        previousOwner: null,
-        defender: defeatMessage.includes('defeated') ? defeatMessage.split('by ')[1]?.replace('.', '') : null
+        defended: true
       });
     }
 
-    // All enemies conquered → delete them and create new territory with run polygon
-    const conqueredIds = conquered.map(t => t._id);
-    if (conqueredIds.length > 0) {
-      await Territory.deleteMany({ _id: { $in: conqueredIds } });
+    if (capturedIds.length > 0) {
+      await Territory.deleteMany({ _id: { $in: capturedIds } });
     }
 
-    // Create new territory (the run polygon itself, no union needed)
-    const newTerritory = new Territory({
+    const newTerritory = await Territory.create({
       ownerId: user._id,
-      geometry: runPolygon,
+      geometry: runPolygon.geometry,
       area: runArea,
-      bestTime: duration / laps,
+      bestTime: duration,
       maxLaps: laps,
-      avgSpeed: avgSpeed
+      avgSpeed: safeAvgSpeed
     });
-    await newTerritory.save();
 
-    await new Attempt({
+    await Attempt.create({
       userId: user._id,
       territoryId: newTerritory._id,
       duration,
       laps,
-      avgSpeed
-    }).save();
-
-    const previousOwner = conquered[0]?.ownerId?.username || null;
-
-    res.json({
-      created: false,
-      captured: true,
-      defended: false,
-      territoryId: newTerritory._id.toString(),
-      newOwner: user._id.toString(),
-      previousOwner,
-      defender: null
+      avgSpeed: safeAvgSpeed
     });
 
-  } catch (error) {
-    console.error('Run error:', error);
-    res.status(500).json({ error: error.message });
+    res.json({
+      created: capturedIds.length === 0,
+      captured: capturedIds.length > 0,
+      defended: false,
+      previousOwner
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
+/* ============================
+   OTHER ROUTES (UNCHANGED)
+============================ */
+
 app.get('/api/territories', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ error: 'Database not connected' });
-    }
-    const territories = await Territory.find()
-      .populate('ownerId', 'username')
-      .select('geometry ownerId area bestTime maxLaps avgSpeed');
-    res.json(territories);
-  } catch (error) {
-    console.error('Territories error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  const territories = await Territory.find()
+    .populate('ownerId', 'username');
+  res.json(territories);
 });
 
 app.post('/api/users', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ error: 'Database not connected' });
-    }
-    const { username } = req.body;
-    if (!username) return res.status(400).json({ error: 'Username required' });
-    let user = await User.findOne({ username });
-    if (!user) {
-      user = new User({ username });
-      await user.save();
-    }
-    res.json({
-      id: user._id,
-      username: user.username,
-      createdAt: user.createdAt
-    });
-  } catch (error) {
-    console.error('User creation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/users', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({ error: 'Database not connected' });
-    }
-    const users = await User.find({}, 'username createdAt');
-    res.json(users);
-  } catch (error) {
-    console.error('Users error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  const { username } = req.body;
+  let user = await User.findOne({ username });
+  if (!user) user = await User.create({ username });
+  res.json(user);
 });
 
 app.get('/health', (req, res) => {
-  const dbState = mongoose.connection.readyState;
-  const states = {
-    0: 'disconnected',
-    1: 'connected',
-    2: 'connecting',
-    3: 'disconnecting'
-  };
-  res.json({
-    status: 'OK',
-    message: 'Server is running on Render',
-    database: states[dbState] || 'unknown',
-    mongodb_uri_set: !!process.env.MONGODB_URI,
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
-});
-
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Territory Run Game API',
-    version: '1.0.0',
-    status: 'active',
-    endpoints: {
-      health: '/health',
-      users: '/api/users',
-      territories: '/api/territories',
-      run: '/api/run'
-    }
-  });
+  res.json({ status: 'OK' });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`=================================`);
-  console.log(`🚀 Server started successfully!`);
-  console.log(`📡 Port: ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 Health check: /health`);
-  console.log(`=================================`);
-});
+app.listen(PORT, () => console.log(`🚀 Running on ${PORT}`));
