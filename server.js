@@ -62,9 +62,21 @@ app.post('/api/run', async (req, res) => {
       return res.status(503).json({ error: 'Database not connected' });
     }
 
-    if (!userId || !polygon || !duration || !laps || !avgSpeed) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
+    if (!userId || !polygon) {
+  return res.status(400).json({ error: 'Missing required fields' });
+}
+
+if (
+  typeof duration !== 'number' ||
+  typeof laps !== 'number' ||
+  typeof avgSpeed !== 'number'
+) {
+  return res.status(400).json({ error: 'Invalid numeric values' });
+}
+
+if (duration <= 0 || laps <= 0 || avgSpeed <= 0) {
+  return res.status(400).json({ error: 'Run data invalid' });
+}
 
     let user = await User.findById(userId);
     if (!user) user = await User.findOne({ username: userId });
