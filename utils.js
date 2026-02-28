@@ -1,57 +1,80 @@
+// utils/territoryUtils.js
 const turf = require('@turf/turf');
 
 /**
- * Determine the outcome of a run against a territory based on containment.
- * Returns { outcome: 'won'|'lost', message?: string }.
- * - 'won' if run polygon contains enemy territory.
- * - 'lost' if enemy contains run, or if they intersect without containment.
- * - If no intersection, the calling function will handle separately.
+ * Create clean polygon from GPS coordinates
  */
-function evaluateChallenge(runPolygon, runAvgSpeed, runLaps, territory) {
-  const enemyGeo = territory.geometry;
-  const userContainsEnemy = turf.booleanContains(runPolygon, enemyGeo);
-  const enemyContainsUser = turf.booleanContains(enemyGeo, runPolygon);
-
-  if (userContainsEnemy) {
-    return { outcome: 'won' };
-  } else if (enemyContainsUser) {
-    return {
-      outcome: 'lost',
-      message: `Your run is inside ${territory.ownerId?.username || 'unknown'}'s territory – no new territory.`
-    };
-  } else {
-    // They intersect but neither contains the other → loss
-    const intersect = turf.intersect(runPolygon, enemyGeo);
-    if (intersect) {
-      return {
-        outcome: 'lost',
-        message: `Your run overlaps ${territory.ownerId?.username || 'unknown'}'s territory but does not encircle it.`
-      };
-    } else {
-      // No intersection – should not happen because we only call this for intersecting territories
-      return { outcome: 'lost', message: 'Unknown error.' };
-    }
+function createRunPolygon(runCoordinates) {
+  if (!runCoordinates || runCoordinates.length < 4) {
+    throw new Error('Not enough coordinates to form territory');
   }
+
+  // Ensure closed loop
+  const first = runCoordinates[0];
+  const last = runCoordinates[runCoordinates.length - 1];
+
+  if (
+    first[0] !== last[0] ||
+    first[1] !== last[1]
+  ) {
+    runCoordinates.push(first);
+  }
+
+  let polygon = turf.lineToPolygon(turf.lineString(runCoordinates));
+
+  // Fix self-intersections
+  const unkinked = turf.unkinkPolygon(polygon);
+
+  if (unkinked.features.length > 1) {
+    // Choose largest polygon
+    let largest = unkinked.features[0];
+
+    for (const feature of unkinked.features) {
+      if (turf.area(feature) > turf.area(largest)) {
+        largest = feature;
+      }
+    }
+
+    polygon = largest;
+  }
+
+  return polygon;
 }
 
 /**
- * Calculate area of a GeoJSON geometry.
+ * Evaluate battle outcome with 70% capture rule
  */
-function calculateArea(geometry) {
-  try {
-    if (!geometry || !geometry.coordinates) {
-      console.error('calculateArea received invalid geometry:', geometry);
-      return 0;
-    }
-    const polygon = turf.polygon(geometry.coordinates);
-    return turf.area(polygon);
-  } catch (error) {
-    console.error('Error in calculateArea:', error, 'geometry:', geometry);
-    return 0;
+function evaluateTerritoryBattle(runPolygon, enemyTerritory) {
+  const enemyGeo = enemyTerritory.geometry;
+
+  const intersection = turf.intersect(runPolygon, enemyGeo);
+
+  if (!intersection) {
+    return { type: 'no_overlap' };
   }
+
+  const overlapArea = turf.area(intersection);
+  const enemyArea = turf.area(enemyGeo);
+
+  const overlapPercent = (overlapArea / enemyArea) * 100;
+
+  const enemyContainsUser = turf.booleanContains(enemyGeo, runPolygon);
+
+  if (enemyContainsUser) {
+    return {
+      type: 'blocked',
+      message: `Your run is fully inside enemy territory`
+    };
+  }
+
+  if (overlapPercent >= 70) {
+    return { type: 'capture' };
+  }
+
+  return { type: 'partial_overlap' };
 }
 
 module.exports = {
-  evaluateChallenge,
-  calculateArea
+  createRunPolygon,
+  evaluateTerritoryBattle
 };
