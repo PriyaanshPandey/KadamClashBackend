@@ -74,7 +74,11 @@ app.post('/api/run', async (req, res) => {
       return res.status(400).json({ error: 'Invalid numbers' });
     }
 
-    const safeAvgSpeed = avgSpeed > 0 ? avgSpeed : 0.1;
+   const safeAvgSpeed = Number(avgSpeed);
+
+if (!Number.isFinite(safeAvgSpeed) || safeAvgSpeed <= 0) {
+  return res.status(400).json({ error: 'Invalid avgSpeed' });
+}
 
     if (duration <= 0 || laps <= 0) {
       return res.status(400).json({ error: 'Invalid run data' });
@@ -104,10 +108,8 @@ app.post('/api/run', async (req, res) => {
     let previousOwner = null;
 
     for (let enemy of enemies) {
-      const intersection = turf.intersect(
-        runPolygon,
-        enemy.geometry
-      );
+      const enemyFeature = turf.feature(enemy.geometry);
+const intersection = turf.intersect(runPolygon, enemyFeature);
 
       if (!intersection) continue;
 
@@ -191,8 +193,15 @@ app.post('/api/users', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK' });
-});
+  const dbState = mongoose.connection.readyState === 1
+    ? 'connected'
+    : 'disconnected';
+
+  res.json({
+    server: 'online',
+    database: dbState
+  });
+});;
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Running on ${PORT}`));
